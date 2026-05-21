@@ -8,6 +8,7 @@ import requests
 import csv
 import io
 import json
+import math
 import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -103,9 +104,12 @@ def fetch_imbalance(year_month: str, revision: str = ''):
     return parse_imbalance_csv(text), url
 
 # ════════════════════════════════════════════════════════════════════
-# PnL計算
+# PnL計算 — revealed_period より先のコマは「未公表(予測中)」扱い
 # ════════════════════════════════════════════════════════════════════
-def calc_pnl(trade: dict, daily_data: list):
+def calc_pnl(trade: dict, daily_data: list, revealed_period: int = 48):
+    # 未公開コマ(revealed_periodより先)は決済不可
+    if trade['period'] > revealed_period:
+        return None, None
     d = next((x for x in daily_data if x['period'] == trade['period']), None)
     if not d:
         return None, None
@@ -164,6 +168,8 @@ def init_state():
     st.session_state.fetch_message = 'データ未取得 — サイドバーから取得してください'
     st.session_state.fetch_state = 'idle'
     st.session_state.active_region = 'tokyo'
+    # プログレッシブ・リビール — 0=未公表, 48=全公表
+    st.session_state.revealed_period = 0
 
 # ════════════════════════════════════════════════════════════════════
 # Streamlit ページ設定
@@ -294,7 +300,8 @@ with st.sidebar:
                 st.session_state.last_updated = datetime.now()
                 st.session_state.fetch_state = 'success'
                 st.session_state.fetch_message = f'{uploaded.name} 読込成功 — {len(data)}行'
-                st.toast(f'✅ {len(data)}行 読込み完了')
+                st.session_state.revealed_period = 0
+                st.toast(f'✅ {len(data)}行 読込み完了 — リビール再開可能')
             else:
                 st.error('有効なD行が見つかりません')
         except Exception as e:
@@ -340,7 +347,9 @@ if fetch_clicked:
                 cnt = sum(1 for d in data if d['date'] == target)
                 st.session_state.fetch_state = 'success'
                 st.session_state.fetch_message = f'取得成功: {len(data)}行 (対象日 {cnt}コマ)'
-                st.toast(f'✅ {len(data)}行 取得 / 対象日 {cnt}コマ')
+                # 新規取得時はリビールをリセット (徐々に公表していく)
+                st.session_state.revealed_period = 0
+                st.toast(f'✅ {len(data)}行 取得 / 対象日 {cnt}コマ — リビール再開可能')
         except requests.HTTPError as e:
             st.error(f'HTTPエラー: {e}')
             st.session_state.fetch_state = 'error'
@@ -357,33 +366,46 @@ daily_data = sorted(
     [r for r in st.session_state.imbalance_data if r['date'] == target_date_str],
     key=lambda x: x['period']
 )
+revealed_period = st.session_state.revealed_period
+# 公表済データ (revealed_period以下のコマだけ)
+revealed_data = [d for d in daily_data if d['period'] <= revealed_period]
 
-# 全取引のPnLを再計算
+# 全取引のPnLを再計算 — 未公開コマの取引は OPEN状態
 for region_id, trades in list(st.session_state.trades.items()):
     for t in trades:
         if t.get('date') != date_iso:
             continue
-        sp, pnl = calc_pnl(t, daily_data)
+        sp, pnl = calc_pnl(t, daily_data, revealed_period)
         if sp is not None:
             t['settlementPrice'] = sp
             t['pnl'] = pnl
+        else:
+            # 未公開 or データなし → OPEN扱い
+            t['settlementPrice'] = None
+            t['pnl'] = None
 
-# 集計
+# 集計 — 未公開コマも数量はNIVに含める(取りに行ったポジション量)
 def compute_stats(region_id):
     trades = [t for t in st.session_state.trades.get(region_id, []) if t.get('date') == date_iso]
     settled = [t for t in trades if t.get('pnl') is not None]
+    long_mw = sum(t['quantity'] for t in trades if t['side'] == 'buy')
+    short_mw = sum(t['quantity'] for t in trades if t['side'] == 'sell')
+    # NIV = Net Imbalance Volume = Long - Short (取得しに行った差分MW)
+    niv = long_mw - short_mw
     return {
         'count': len(trades),
         'open': len(trades) - len(settled),
         'total_pnl': sum(t['pnl'] for t in settled),
-        'long_mw': sum(t['quantity'] for t in trades if t['side'] == 'buy'),
-        'short_mw': sum(t['quantity'] for t in trades if t['side'] == 'sell'),
+        'long_mw': long_mw,
+        'short_mw': short_mw,
+        'niv': niv,
     }
 
 stats = {r['id']: compute_stats(r['id']) for r in REGIONS}
 grand_pnl = sum(s['total_pnl'] for s in stats.values())
 total_trades = sum(s['count'] for s in stats.values())
 total_open = sum(s['open'] for s in stats.values())
+grand_niv = sum(s['niv'] for s in stats.values())
 
 # ════════════════════════════════════════════════════════════════════
 # メイン画面
@@ -391,17 +413,24 @@ total_open = sum(s['open'] for s in stats.values())
 st.markdown('<div class="app-title">⚡ Intraday Imbalance Trader</div>', unsafe_allow_html=True)
 st.caption(f'JEPX × ICS · 30分コマ毎のインバランス料金単価バックテスト · 対象日 **{date_iso}**')
 
-# === KPI ===
-k1, k2, k3, k4 = st.columns(4)
+# === KPI (5列) — NIV を追加 ===
+k1, k2, k3, k4, k5 = st.columns(5)
 with k1:
     st.metric('Grand Total PnL', fmt_jpy(grand_pnl))
 with k2:
-    st.metric('総取引数', f'{total_trades}件')
+    # NIV = Net Imbalance Volume (Long − Short MW) 全エリア合算
+    niv_sign = '+' if grand_niv > 0 else ''
+    st.metric('NIV (全体)', f'{niv_sign}{grand_niv:,.2f} MW',
+              help='Net Imbalance Volume = Long − Short の符号付き合計')
 with k3:
-    st.metric('オープン', f'{total_open}件')
+    st.metric('総取引数', f'{total_trades}件')
 with k4:
+    st.metric('オープン', f'{total_open}件',
+              help='未公表コマ or 約定価格未取得の取引数')
+with k5:
     cnt = len(daily_data)
-    st.metric('取得済コマ', f'{cnt}/48')
+    st.metric('公表済 / 取得済', f'{revealed_period} / {cnt}',
+              help=f'公表済={revealed_period}コマ、取得済={cnt}コマ (最大48)')
 
 # 状態メッセージ
 if st.session_state.fetch_state == 'error':
@@ -444,14 +473,102 @@ active_region = st.session_state.active_region
 active_region_obj = REGION_BY_ID[active_region]
 
 # ════════════════════════════════════════════════════════════════════
+# プログレッシブ・リビール — コマを徐々に公表
+# ════════════════════════════════════════════════════════════════════
+st.markdown('### ⏱️ コマ公表コントロール (プログレッシブ・リビール)')
+
+max_available = len(daily_data)  # データ取得済の最大コマ数
+if max_available == 0:
+    st.caption('データ未取得 — まずサイドバーから取得してください')
+else:
+    # 進捗バー
+    progress_val = revealed_period / 48 if revealed_period > 0 else 0
+    revealed_label = (
+        f'P{revealed_period:02d} ({PERIODS[revealed_period-1]["endTime"]} まで公表済)'
+        if revealed_period > 0 else '未公表 (0コマ)'
+    )
+    st.progress(progress_val, text=f'公表済: {revealed_label} / 全48コマ · 取得済データ: {max_available}コマ')
+
+    # ボタン群
+    pb1, pb2, pb3, pb4, pb5 = st.columns([1, 1, 1, 1, 1])
+    with pb1:
+        if st.button(
+            '▶️ 次のコマ',
+            use_container_width=True,
+            disabled=(revealed_period >= max_available),
+            help='次の30分コマを1つ公表'
+        ):
+            st.session_state.revealed_period = min(max_available, revealed_period + 1)
+            st.rerun()
+    with pb2:
+        if st.button(
+            '⏩ +6コマ (3h)',
+            use_container_width=True,
+            disabled=(revealed_period >= max_available),
+            help='3時間分(6コマ)を一気に公表'
+        ):
+            st.session_state.revealed_period = min(max_available, revealed_period + 6)
+            st.rerun()
+    with pb3:
+        if st.button(
+            '⏭️ +12コマ (6h)',
+            use_container_width=True,
+            disabled=(revealed_period >= max_available),
+            help='6時間分(12コマ)を一気に公表'
+        ):
+            st.session_state.revealed_period = min(max_available, revealed_period + 12)
+            st.rerun()
+    with pb4:
+        if st.button(
+            '🔚 全公表',
+            use_container_width=True,
+            disabled=(revealed_period >= max_available),
+            help='取得済の全コマを一括公表'
+        ):
+            st.session_state.revealed_period = max_available
+            st.rerun()
+    with pb5:
+        if st.button(
+            '🔙 公表リセット',
+            use_container_width=True,
+            disabled=(revealed_period == 0),
+            help='公表を最初に戻す (取引履歴は保持)'
+        ):
+            st.session_state.revealed_period = 0
+            st.rerun()
+
+    # 次に公表されるコマの情報
+    if 0 <= revealed_period < max_available:
+        next_p = revealed_period + 1
+        st.caption(
+            f'👁️ 次に公表されるコマ: **P{next_p:02d}** ({PERIODS[next_p-1]["label"]}) '
+            f'— このコマへの予測ベットは「発注」フォームから可能'
+        )
+
+# ════════════════════════════════════════════════════════════════════
 # チャート
 # ════════════════════════════════════════════════════════════════════
-st.markdown(f"### 📊 {active_region_obj['name']} エリア — 料金単価 & 約定価格")
+st.markdown(f"### 📊 {active_region_obj['name']} エリア — 料金単価 & 約定価格 (公表済のみ表示)")
+
+# エリア別の小型KPI (このエリアのPnL/NIV/取引数)
+_as = stats[active_region]
+ak1, ak2, ak3, ak4 = st.columns(4)
+with ak1:
+    st.metric(f"{active_region_obj['name']} PnL", fmt_jpy(_as['total_pnl']))
+with ak2:
+    _niv = _as['niv']
+    st.metric(f"{active_region_obj['name']} NIV", f"{'+' if _niv>0 else ''}{_niv:,.2f} MW",
+              help='このエリアのNet Imbalance Volume')
+with ak3:
+    st.metric('Long / Short', f"{_as['long_mw']:.2f} / {_as['short_mw']:.2f} MW")
+with ak4:
+    st.metric('取引 / オープン', f"{_as['count']} / {_as['open']} 件")
 
 times = [p['startTime'] for p in PERIODS]
 shortage = [None] * 48
 surplus = [None] * 48
-for d in daily_data:
+# 公表済 (revealed_period以下) のコマだけ価格をセット
+for d in revealed_data:
     idx = d['period'] - 1
     if 0 <= idx < 48:
         p = d['prices'].get(active_region, {})
@@ -463,58 +580,158 @@ region_trades_today = [
     if t.get('date') == date_iso
 ]
 
-# 同コマ複数発注は加重平均で1点に集約
-buy_pts, sell_pts = {}, {}
+# 同コマ複数発注は加重平均で1点に集約 — 公表済(settled)/未公表(open) を区別
+def empty_bucket():
+    return {'num': 0, 'den': 0, 'qty': 0, 'count': 0, 'pnl_sum': 0, 'sp': None}
+
+buy_settled, buy_open = {}, {}
+sell_settled, sell_open = {}, {}
 for t in region_trades_today:
-    bucket = buy_pts if t['side'] == 'buy' else sell_pts
+    is_revealed = t['period'] <= revealed_period and t.get('settlementPrice') is not None
+    if t['side'] == 'buy':
+        bucket = buy_settled if is_revealed else buy_open
+    else:
+        bucket = sell_settled if is_revealed else sell_open
     p = t['period']
     if p not in bucket:
-        bucket[p] = {'num': 0, 'den': 0, 'qty': 0, 'count': 0}
+        bucket[p] = empty_bucket()
     bucket[p]['num'] += t['price'] * t['quantity']
     bucket[p]['den'] += t['quantity']
     bucket[p]['qty'] += t['quantity']
     bucket[p]['count'] += 1
+    bucket[p]['sp'] = t.get('settlementPrice')
+    if t.get('pnl') is not None:
+        bucket[p]['pnl_sum'] += t['pnl']
 
-def agg_to_xy(bucket):
-    xs, ys, txt = [], [], []
+def size_for(qty):
+    """MWに応じてマーカーサイズを8〜30pxにマッピング"""
+    return min(30, max(8, 10 + math.log10(max(0.1, qty)) * 8))
+
+def agg_to_xy(bucket, side_label, is_settled):
+    xs, ys, sizes, txt, sps, pnls = [], [], [], [], [], []
     for period, v in sorted(bucket.items()):
         idx = period - 1
         if 0 <= idx < 48 and v['den'] > 0:
             xs.append(times[idx])
             wavg = v['num'] / v['den']
             ys.append(wavg)
-            txt.append(f"P{period:02d} · {PERIODS[idx]['label']}<br>"
-                       f"加重平均 {wavg:.2f} 円/kWh<br>"
-                       f"合計 {v['qty']:.2f} MW × {v['count']}件")
-    return xs, ys, txt
+            sizes.append(size_for(v['qty']))
+            status = '✅ 約定' if is_settled else '⏳ 未公表'
+            pnl_str = fmt_jpy(v['pnl_sum']) if is_settled else '— (予測中)'
+            sp_str = f"{v['sp']:.2f}" if v['sp'] is not None else '—'
+            txt.append(
+                f"<b>P{period:02d} · {PERIODS[idx]['label']}</b><br>"
+                f"{side_label} 加重平均 {wavg:.2f} 円/kWh<br>"
+                f"合計 {v['qty']:.2f} MW × {v['count']}件<br>"
+                f"状態: {status}<br>"
+                f"約定価格: {sp_str}<br>"
+                f"PnL: {pnl_str}"
+            )
+            sps.append(v['sp'])
+            pnls.append(v['pnl_sum'] if is_settled else None)
+    return xs, ys, sizes, txt, sps, pnls
 
-buy_x, buy_y, buy_txt = agg_to_xy(buy_pts)
-sell_x, sell_y, sell_txt = agg_to_xy(sell_pts)
+bs_x, bs_y, bs_sz, bs_txt, bs_sp, bs_pnl = agg_to_xy(buy_settled,  '買い', True)
+bo_x, bo_y, bo_sz, bo_txt, _,    _       = agg_to_xy(buy_open,    '買い', False)
+ss_x, ss_y, ss_sz, ss_txt, ss_sp, ss_pnl = agg_to_xy(sell_settled, '売り', True)
+so_x, so_y, so_sz, so_txt, _,    _       = agg_to_xy(sell_open,   '売り', False)
+
+# 約定済取引のスプレッド線 (BID価格 ↔ 約定価格) — 損益を視覚化
+spread_x, spread_y, spread_colors = [], [], []
+def add_spreads(xs, ys, sps, pnls):
+    for x, y, sp, pnl in zip(xs, ys, sps, pnls):
+        if sp is None: continue
+        spread_x.extend([x, x, None])
+        spread_y.extend([y, sp, None])
+add_spreads(bs_x, bs_y, bs_sp, bs_pnl)
+add_spreads(ss_x, ss_y, ss_sp, ss_pnl)
 
 fig = go.Figure()
+
+# --- 価格ライン (公表済のみ — Noneは自動でgapになる)
 fig.add_trace(go.Scatter(
     x=times, y=shortage, name='不足単価 (Buy決済)',
     mode='lines', line=dict(color='#f0b541', width=2.5),
-    hovertemplate='%{x}<br>不足 %{y:.2f} 円/kWh<extra></extra>',
-    connectgaps=True,
+    hovertemplate='%{x}<br>不足単価 %{y:.2f} 円/kWh<extra></extra>',
+    connectgaps=False,
 ))
 fig.add_trace(go.Scatter(
     x=times, y=surplus, name='余剰単価 (Sell決済)',
     mode='lines', line=dict(color='#22d3ee', width=2, dash='dash'),
-    hovertemplate='%{x}<br>余剰 %{y:.2f} 円/kWh<extra></extra>',
-    connectgaps=True,
+    hovertemplate='%{x}<br>余剰単価 %{y:.2f} 円/kWh<extra></extra>',
+    connectgaps=False,
 ))
+
+# --- スプレッド線 (約定済の損益視覚化)
+if spread_x:
+    fig.add_trace(go.Scatter(
+        x=spread_x, y=spread_y, mode='lines',
+        line=dict(color='rgba(226,232,240,0.35)', width=1),
+        name='損益スプレッド', showlegend=True,
+        hoverinfo='skip',
+    ))
+
+# --- 公表済リビール境界線 (現在のリビール位置を縦線で表示)
+if revealed_period > 0 and revealed_period < 48:
+    boundary_idx = revealed_period - 1
+    if 0 <= boundary_idx < 48:
+        fig.add_vline(
+            x=times[boundary_idx], line=dict(color='rgba(240,181,65,0.4)', width=1, dash='dot'),
+            annotation_text=f'公表境界 P{revealed_period:02d}',
+            annotation_position='top',
+            annotation=dict(font=dict(size=10, color='#f0b541')),
+        )
+
+# --- 買い注文(約定済): 実線の緑円、サイズはMW比例
 fig.add_trace(go.Scatter(
-    x=buy_x, y=buy_y, name='買い注文',
+    x=bs_x, y=bs_y, name='買い注文 (約定済)',
     mode='markers',
-    marker=dict(size=14, color='#22c55e', line=dict(color='#022c1a', width=2), symbol='circle'),
-    text=buy_txt, hovertemplate='%{text}<extra></extra>',
+    marker=dict(
+        size=bs_sz, color='#22c55e',
+        line=dict(color='#022c1a', width=2),
+        symbol='circle',
+    ),
+    text=bs_txt, hovertemplate='%{text}<extra></extra>',
+    showlegend=bool(bs_x),
 ))
+
+# --- 買い注文(未公表/予測): 半透明・点線縁の緑円
 fig.add_trace(go.Scatter(
-    x=sell_x, y=sell_y, name='売り注文',
+    x=bo_x, y=bo_y, name='買い注文 (予測中)',
     mode='markers',
-    marker=dict(size=14, color='#ef4444', line=dict(color='#2c0808', width=2), symbol='circle'),
-    text=sell_txt, hovertemplate='%{text}<extra></extra>',
+    marker=dict(
+        size=bo_sz, color='rgba(34,197,94,0.35)',
+        line=dict(color='#22c55e', width=2),
+        symbol='circle-open',
+    ),
+    text=bo_txt, hovertemplate='%{text}<extra></extra>',
+    showlegend=bool(bo_x),
+))
+
+# --- 売り注文(約定済): 実線の赤円
+fig.add_trace(go.Scatter(
+    x=ss_x, y=ss_y, name='売り注文 (約定済)',
+    mode='markers',
+    marker=dict(
+        size=ss_sz, color='#ef4444',
+        line=dict(color='#2c0808', width=2),
+        symbol='circle',
+    ),
+    text=ss_txt, hovertemplate='%{text}<extra></extra>',
+    showlegend=bool(ss_x),
+))
+
+# --- 売り注文(未公表/予測): 半透明の赤円
+fig.add_trace(go.Scatter(
+    x=so_x, y=so_y, name='売り注文 (予測中)',
+    mode='markers',
+    marker=dict(
+        size=so_sz, color='rgba(239,68,68,0.35)',
+        line=dict(color='#ef4444', width=2),
+        symbol='circle-open',
+    ),
+    text=so_txt, hovertemplate='%{text}<extra></extra>',
+    showlegend=bool(so_x),
 ))
 
 fig.update_layout(
@@ -572,9 +789,11 @@ with st.form('order_form', clear_on_submit=False):
             min_value=0.0, max_value=10000.0, value=1.0, step=0.1, format='%.2f',
         )
 
-    # 想定PnLプレビュー
+    # 想定PnLプレビュー — 公表済なら確定PnL、未公表なら予測モード
+    is_revealed = order_period <= revealed_period
     preview_d = next((x for x in daily_data if x['period'] == order_period), None)
-    if preview_d:
+
+    if is_revealed and preview_d:
         sp = preview_d['prices'].get(active_region, {}).get(
             'shortage' if order_side == 'buy' else 'surplus'
         )
@@ -582,21 +801,44 @@ with st.form('order_form', clear_on_submit=False):
             if order_side == 'buy':
                 ppnl = (sp - order_price) * 500 * order_qty
                 st.markdown(
-                    f"想定PnL = ( **不足単価 {sp:.2f}** − BID {order_price} ) × 500 × {order_qty} = "
+                    f"💡 **公表済コマ** — 確定PnL = ( **不足単価 {sp:.2f}** − BID {order_price} ) × 500 × {order_qty} = "
                     f"<span class='{'pnl-pos' if ppnl>0 else 'pnl-neg' if ppnl<0 else 'pnl-zero'}'>{fmt_jpy(ppnl)}</span>",
                     unsafe_allow_html=True
                 )
             else:
                 ppnl = (order_price - sp) * 500 * order_qty
                 st.markdown(
-                    f"想定PnL = ( BID {order_price} − **余剰単価 {sp:.2f}** ) × 500 × {order_qty} = "
+                    f"💡 **公表済コマ** — 確定PnL = ( BID {order_price} − **余剰単価 {sp:.2f}** ) × 500 × {order_qty} = "
                     f"<span class='{'pnl-pos' if ppnl>0 else 'pnl-neg' if ppnl<0 else 'pnl-zero'}'>{fmt_jpy(ppnl)}</span>",
                     unsafe_allow_html=True
                 )
         else:
-            st.caption('⚠️ このコマの約定価格は未公表 — OPENポジションとして登録されます')
+            st.caption('⚠️ このコマの約定価格データなし — OPENポジションとして登録')
     else:
-        st.caption('⚠️ このコマのインバランスデータが未取得 — OPENポジションとして登録')
+        # 未公表 = 予測モード
+        if preview_d and st.session_state.imbalance_data:
+            # データは取得済だが未公表 → 予測モード
+            st.info(
+                f'🔮 **予測モード** — P{order_period:02d} はまだ公表されていません。'
+                f' 公表後(リビールで進めると)に自動で損益が確定します。'
+            )
+            # 想定シナリオ提示 — 直近公表値から仮想PnLを試算
+            if revealed_period > 0 and revealed_data:
+                last_revealed = revealed_data[-1]
+                last_sp = last_revealed['prices'].get(active_region, {}).get(
+                    'shortage' if order_side == 'buy' else 'surplus'
+                )
+                if last_sp is not None:
+                    if order_side == 'buy':
+                        hyp = (last_sp - order_price) * 500 * order_qty
+                    else:
+                        hyp = (order_price - last_sp) * 500 * order_qty
+                    st.caption(
+                        f'参考: 直近公表P{last_revealed["period"]:02d}価格({last_sp:.2f}円/kWh)で同水準が続いた場合 → '
+                        f'想定PnL ≈ {fmt_jpy(hyp)}'
+                    )
+        else:
+            st.caption('⚠️ このコマのインバランスデータが未取得 — OPENポジションとして登録')
 
     submitted = st.form_submit_button(
         f"{'🟢 買い発注' if order_side == 'buy' else '🔴 売り発注'} — {active_region_obj['name']}",
@@ -608,17 +850,19 @@ with st.form('order_form', clear_on_submit=False):
             st.error('数量は正の数を入力してください')
         else:
             sp, pnl = (None, None)
-            d = next((x for x in daily_data if x['period'] == order_period), None)
-            if d:
-                sp_check = d['prices'].get(active_region, {}).get(
-                    'shortage' if order_side == 'buy' else 'surplus'
-                )
-                if sp_check is not None:
-                    sp = sp_check
-                    if order_side == 'buy':
-                        pnl = (sp - order_price) * 500 * order_qty
-                    else:
-                        pnl = (order_price - sp) * 500 * order_qty
+            # 公表済 (revealed_period以下) のコマだけ即時PnL計算
+            if order_period <= revealed_period:
+                d = next((x for x in daily_data if x['period'] == order_period), None)
+                if d:
+                    sp_check = d['prices'].get(active_region, {}).get(
+                        'shortage' if order_side == 'buy' else 'surplus'
+                    )
+                    if sp_check is not None:
+                        sp = sp_check
+                        if order_side == 'buy':
+                            pnl = (sp - order_price) * 500 * order_qty
+                        else:
+                            pnl = (order_price - sp) * 500 * order_qty
 
             trade = {
                 'id': f"{int(time.time()*1000)}-{order_period}-{order_side}",
@@ -638,13 +882,13 @@ with st.form('order_form', clear_on_submit=False):
             side_label = '買い' if order_side == 'buy' else '売り'
             if pnl is not None:
                 st.success(
-                    f"✅ {active_region_obj['name']} P{order_period:02d} {side_label} "
+                    f"✅ 発注 (約定済) — {active_region_obj['name']} P{order_period:02d} {side_label} "
                     f"@{order_price} × {order_qty}MW → PnL **{fmt_jpy(pnl)}**"
                 )
             else:
                 st.warning(
-                    f"✅ 発注完了 (OPEN) — {active_region_obj['name']} P{order_period:02d} "
-                    f"{side_label} @{order_price} × {order_qty}MW"
+                    f"🔮 発注 (予測中) — {active_region_obj['name']} P{order_period:02d} "
+                    f"{side_label} @{order_price} × {order_qty}MW · 公表後に損益確定"
                 )
 
 # ════════════════════════════════════════════════════════════════════
@@ -662,6 +906,13 @@ if not region_trades:
 else:
     rows = []
     for t in region_trades:
+        is_revealed = t['period'] <= revealed_period
+        if t.get('pnl') is not None:
+            status = '✅ 約定'
+        elif is_revealed:
+            status = '⚠️ データなし'
+        else:
+            status = '🔮 予測中'
         rows.append({
             'コマ': f"P{t['period']:02d}",
             '時間帯': PERIODS[t['period'] - 1]['label'],
@@ -670,6 +921,7 @@ else:
             '数量(MW)': t['quantity'],
             '約定価格': t.get('settlementPrice'),
             'PnL': t.get('pnl'),
+            '状態': status,
             '時刻': t.get('timestamp', '')[-8:] if t.get('timestamp') else '',
         })
     df = pd.DataFrame(rows)
@@ -717,7 +969,7 @@ for r in REGIONS:
         'オープン': s['open'],
         'Long(MW)': s['long_mw'],
         'Short(MW)': s['short_mw'],
-        'Net(MW)': s['long_mw'] - s['short_mw'],
+        'NIV(MW)': s['niv'],
         'PnL': s['total_pnl'],
     })
 summary_df = pd.DataFrame(summary_rows)
@@ -728,7 +980,7 @@ st.dataframe(
     column_config={
         'Long(MW)': st.column_config.NumberColumn(format='%.2f'),
         'Short(MW)': st.column_config.NumberColumn(format='%.2f'),
-        'Net(MW)': st.column_config.NumberColumn(format='%.2f'),
+        'NIV(MW)': st.column_config.NumberColumn(format='%+.2f', help='Net Imbalance Volume = Long − Short'),
         'PnL': st.column_config.NumberColumn(format='¥%.0f'),
     },
 )
@@ -736,13 +988,26 @@ st.dataframe(
 # ════════════════════════════════════════════════════════════════════
 # PnL計算式メモ
 # ════════════════════════════════════════════════════════════════════
-with st.expander('📐 PnL計算式・ICS API仕様'):
+with st.expander('📐 PnL計算式・ICS API仕様・新機能'):
     st.markdown("""
 **PnL計算式:**
 - 買い (Buy):  `(不足単価 − BIDした価格) × 500 × bidした数量(MW)`
 - 売り (Sell): `(BIDした価格 − 余剰単価) × 500 × bidした数量(MW)`
 
 **単位変換:** 500 = 0.5時間 × 1000kW/MW → 円/kWh × MW を 円 に変換
+
+**NIV (Net Imbalance Volume):**
+- 定義: `Long(買いMW合計) − Short(売りMW合計)`
+- 正の値 = ネット買い超過 (ロング)、負の値 = ネット売り超過 (ショート)
+- 約定済 / 未公表問わず取得しに行った全ポジションを集計
+
+**プログレッシブ・リビール (新機能):**
+- データ取得後、価格は最初すべて非表示
+- 「次のコマ」「+6コマ」「+12コマ」「全公表」ボタンで段階的に公表
+- 未公表コマへのBIDは「予測中(🔮)」状態 — チャート上は半透明マーカーで表示
+- 公表が進むと自動でPnLが確定し、約定済マーカー(実線)に変化
+- スプレッド線(BID価格↔約定価格)で各取引の損益が視覚化される
+- マーカーサイズは数量(MW)に比例(log10スケール)
 
 **APIエンドポイント:** `https://www.imbalanceprices-cs.jp/api/1.0/imb/price/{YYYYMM}/{revision}`
 - データ形式: CSV (MS932/Shift_JIS)
