@@ -672,14 +672,26 @@ if spread_x:
     ))
 
 # --- 公表済リビール境界線 (現在のリビール位置を縦線で表示)
+#     注: add_vline は カテゴリX軸 (時刻文字列) で内部の _mean() が失敗するため
+#         add_shape + add_annotation を別々に使う
 if revealed_period > 0 and revealed_period < 48:
     boundary_idx = revealed_period - 1
     if 0 <= boundary_idx < 48:
-        fig.add_vline(
-            x=times[boundary_idx], line=dict(color='rgba(240,181,65,0.4)', width=1, dash='dot'),
-            annotation_text=f'公表境界 P{revealed_period:02d}',
-            annotation_position='top',
-            annotation=dict(font=dict(size=10, color='#f0b541')),
+        x_val = times[boundary_idx]
+        fig.add_shape(
+            type='line',
+            xref='x', yref='paper',
+            x0=x_val, x1=x_val, y0=0, y1=1,
+            line=dict(color='rgba(240,181,65,0.4)', width=1, dash='dot'),
+        )
+        fig.add_annotation(
+            xref='x', yref='paper',
+            x=x_val, y=1.0,
+            text=f'公表境界 P{revealed_period:02d}',
+            showarrow=False,
+            font=dict(size=10, color='#f0b541'),
+            yshift=10,
+            bgcolor='rgba(2,6,23,0.6)',
         )
 
 # --- 買い注文(約定済): 実線の緑円、サイズはMW比例
