@@ -648,41 +648,120 @@ add_spreads(ss_x, ss_y, ss_sp, ss_pnl)
 
 fig = go.Figure()
 
-# --- 価格ライン (公表済のみ — Noneは自動でgapになる)
+# ============================================================
+# 1. 背景: NIV棒グラフ (右Y軸, 一番後ろに描画)
+# ============================================================
+# アクティブエリアのコマ毎NIV (=Long MW − Short MW)
+period_niv = [0.0] * 48
+period_niv_long = [0.0] * 48
+period_niv_short = [0.0] * 48
+for t in region_trades_today:
+    idx = t['period'] - 1
+    if 0 <= idx < 48:
+        q = t['quantity']
+        if t['side'] == 'buy':
+            period_niv[idx] += q
+            period_niv_long[idx] += q
+        else:
+            period_niv[idx] -= q
+            period_niv_short[idx] += q
+
+# 0以外のコマだけ表示するために、0は Noneにしておく(バーが消える)
+has_any_niv = any(v != 0 for v in period_niv)
+niv_display = [v if v != 0 else None for v in period_niv]
+niv_colors = [
+    'rgba(96,165,250,0.55)' if (v or 0) >= 0 else 'rgba(251,113,133,0.55)'
+    for v in period_niv
+]
+niv_hover = []
+for i, v in enumerate(period_niv):
+    if v == 0:
+        niv_hover.append('')
+    else:
+        sign = '+' if v > 0 else ''
+        niv_hover.append(
+            f"<b>P{i+1:02d} · {PERIODS[i]['label']}</b><br>"
+            f"NIV {sign}{v:.2f} MW<br>"
+            f"Long {period_niv_long[i]:.2f} / Short {period_niv_short[i]:.2f} MW"
+        )
+
+if has_any_niv:
+    fig.add_trace(go.Bar(
+        x=times, y=niv_display,
+        name='NIV (MW)',
+        marker=dict(color=niv_colors, line=dict(width=0)),
+        yaxis='y2',
+        text=niv_hover, hovertemplate='%{text}<extra></extra>',
+        opacity=0.85,
+    ))
+
+# ============================================================
+# 2. 背景: 他エリアの参考価格 (薄い灰色, 凡例非表示)
+# ============================================================
+for r in REGIONS:
+    if r['id'] == active_region:
+        continue
+    other_y = [None] * 48
+    for d in revealed_data:
+        idx = d['period'] - 1
+        if 0 <= idx < 48:
+            other_y[idx] = d['prices'].get(r['id'], {}).get('shortage')
+    if any(v is not None for v in other_y):
+        fig.add_trace(go.Scatter(
+            x=times, y=other_y,
+            mode='lines',
+            line=dict(color='rgba(148,163,184,0.18)', width=1),
+            name=f"{r['name']} (参考)",
+            showlegend=False,
+            hovertemplate=f"{r['name']}: %{{y:.2f}} 円/kWh<extra></extra>",
+            connectgaps=False,
+        ))
+
+# ============================================================
+# 3. メイン: アクティブエリアの価格ライン (左Y軸)
+# ============================================================
 fig.add_trace(go.Scatter(
-    x=times, y=shortage, name='不足単価 (Buy決済)',
-    mode='lines', line=dict(color='#f0b541', width=2.5),
+    x=times, y=shortage, name=f'不足単価 ({active_region_obj["name"]})',
+    mode='lines+markers',
+    line=dict(color='#f0b541', width=2.5),
+    marker=dict(size=5, color='#f0b541'),
     hovertemplate='%{x}<br>不足単価 %{y:.2f} 円/kWh<extra></extra>',
     connectgaps=False,
 ))
 fig.add_trace(go.Scatter(
-    x=times, y=surplus, name='余剰単価 (Sell決済)',
-    mode='lines', line=dict(color='#22d3ee', width=2, dash='dash'),
+    x=times, y=surplus, name=f'余剰単価 ({active_region_obj["name"]})',
+    mode='lines',
+    line=dict(color='#22d3ee', width=2, dash='dash'),
     hovertemplate='%{x}<br>余剰単価 %{y:.2f} 円/kWh<extra></extra>',
     connectgaps=False,
 ))
 
-# --- スプレッド線 (約定済の損益視覚化)
+# ============================================================
+# 4. スプレッド線 (約定済の損益視覚化, 左Y軸)
+# ============================================================
 if spread_x:
     fig.add_trace(go.Scatter(
         x=spread_x, y=spread_y, mode='lines',
-        line=dict(color='rgba(226,232,240,0.35)', width=1),
+        line=dict(color='rgba(226,232,240,0.4)', width=1),
         name='損益スプレッド', showlegend=True,
         hoverinfo='skip',
     ))
 
-# --- 公表済リビール境界線 (現在のリビール位置を縦線で表示)
-#     注: add_vline は カテゴリX軸 (時刻文字列) で内部の _mean() が失敗するため
-#         add_shape + add_annotation を別々に使う
+# ============================================================
+# 5. 公表済リビール境界線 (現在のリビール位置を縦線+背景帯)
+# ============================================================
 if revealed_period > 0 and revealed_period < 48:
     boundary_idx = revealed_period - 1
     if 0 <= boundary_idx < 48:
         x_val = times[boundary_idx]
+        # 縦の強調帯 (黄色、半透明) — 公表境界
         fig.add_shape(
-            type='line',
+            type='rect',
             xref='x', yref='paper',
-            x0=x_val, x1=x_val, y0=0, y1=1,
-            line=dict(color='rgba(240,181,65,0.4)', width=1, dash='dot'),
+            x0=times[max(0, boundary_idx)], x1=times[min(47, boundary_idx + 1)],
+            y0=0, y1=1,
+            fillcolor='rgba(240,181,65,0.18)', line=dict(width=0),
+            layer='below',
         )
         fig.add_annotation(
             xref='x', yref='paper',
@@ -691,7 +770,7 @@ if revealed_period > 0 and revealed_period < 48:
             showarrow=False,
             font=dict(size=10, color='#f0b541'),
             yshift=10,
-            bgcolor='rgba(2,6,23,0.6)',
+            bgcolor='rgba(2,6,23,0.7)',
         )
 
 # --- 買い注文(約定済): 実線の緑円、サイズはMW比例
@@ -750,8 +829,8 @@ fig.update_layout(
     template='plotly_dark',
     paper_bgcolor='rgba(0,0,0,0)',
     plot_bgcolor='rgba(15,23,42,0.4)',
-    height=380,
-    margin=dict(l=50, r=20, t=20, b=50),
+    height=420,
+    margin=dict(l=50, r=60, t=30, b=50),
     xaxis=dict(
         title='時刻',
         gridcolor='#1e293b',
@@ -759,14 +838,40 @@ fig.update_layout(
         nticks=12,
     ),
     yaxis=dict(
-        title='円/kWh',
+        title=dict(text='円/kWh', font=dict(color='#f0b541')),
         gridcolor='#1e293b',
+        tickfont=dict(color='#cbd5e1'),
+        zeroline=False,
     ),
-    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, bgcolor='rgba(0,0,0,0)'),
+    yaxis2=dict(
+        title=dict(text='NIV (MW)', font=dict(color='#60a5fa')),
+        overlaying='y',
+        side='right',
+        showgrid=False,
+        zeroline=True,
+        zerolinecolor='rgba(96,165,250,0.4)',
+        zerolinewidth=1,
+        tickfont=dict(color='#94a3b8', size=10),
+        ticksuffix=' MW',
+    ),
+    legend=dict(
+        orientation='h', yanchor='bottom', y=1.02,
+        xanchor='right', x=1, bgcolor='rgba(0,0,0,0)',
+        font=dict(size=10),
+    ),
     hovermode='closest',
     font=dict(family='JetBrains Mono, monospace', size=11),
+    bargap=0.15,
 )
 st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+
+# チャート凡例の補足説明
+st.caption(
+    '📊 **左軸: 円/kWh** (不足単価=黄色実線, 余剰単価=シアン破線) · '
+    '**右軸: NIV MW** (青棒=ロング, 赤棒=ショート) · '
+    '薄い灰色の線=他8エリアの参考価格 · '
+    '黄色帯=公表境界(次に公表されるコマ)'
+)
 
 # ════════════════════════════════════════════════════════════════════
 # 発注フォーム
